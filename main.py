@@ -40,10 +40,12 @@ def setup_database():
 # Get executable path from window
 def get_exe_from_window(win):
     try:
-        pid = gw.getWindowsWithTitle(win.title)[0]._hWnd
+        hwnd = win._hWnd  # Use window handle directly
         for proc in psutil.process_iter(['pid', 'exe', 'name']):
-            if proc.info['pid'] == pid:
-                return proc.info['exe'] or proc.info['name']
+            if proc.pid == hwnd:  # Note: This might need adjustment; see below
+                exe = proc.info['exe']
+                if exe and os.path.exists(exe):
+                    return exe
     except Exception as e:
         print(f"Error getting exe for {win.title}: {e}")
     return None
@@ -68,16 +70,19 @@ def save_state(conn):
     
     # Add or update open windows
     for win in current_windows:
-        if win.title and win.visible:  # Fixed: use 'visible' instead of 'isVisible'
-            exe_path = get_exe_from_window(win) or APP_EXECUTABLES.get(win.title.split('-')[-1].strip(), win.title.split('-')[-1].strip())
+        if win.title and win.visible:
+            exe_path = get_exe_from_window(win)
             app_name = win.title.split('-')[-1].strip() if '-' in win.title else win.title
-            if win.title in db_windows:
-                c.execute("UPDATE windows SET app_name = ?, exe_path = ?, x = ?, y = ?, width = ?, height = ?, closed_time = NULL WHERE title = ?",
-                         (app_name, exe_path, win.left, win.top, win.width, win.height, win.title))
-            else:
-                c.execute("INSERT INTO windows (app_name, title, exe_path, x, y, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                         (app_name, win.title, exe_path, win.left, win.top, win.width, win.height))
-                print(f"Saved new window: {win.title} with exe: {exe_path}")
+            # Only save if we have a valid executable or a known mapping
+            if exe_path or app_name in APP_EXECUTABLES:
+                exe_path = exe_path or APP_EXECUTABLES.get(app_name)
+                if win.title in db_windows:
+                    c.execute("UPDATE windows SET app_name = ?, exe_path = ?, x = ?, y = ?, width = ?, height = ?, closed_time = NULL WHERE title = ?",
+                             (app_name, exe_path, win.left, win.top, win.width, win.height, win.title))
+                else:
+                    c.execute("INSERT INTO windows (app_name, title, exe_path, x, y, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             (app_name, win.title, exe_path, win.left, win.top, win.width, win.height))
+                    print(f"Saved new window: {win.title} with exe: {exe_path}")
     
     # Remove windows closed for more than 2 minutes
     delay = SETTINGS["closure_delay"]
@@ -110,8 +115,8 @@ def restore_state(conn):
             if "Chrome" in app_name:
                 continue
             exe = APP_EXECUTABLES.get(app_name, exe_path)
-            if not exe:
-                print(f"No executable found for {app_name}")
+            if not exe or not (os.path.exists(exe) or exe.startswith("ms-settings:")):
+                print(f"Skipping {app_name}: Invalid or missing executable {exe}")
                 continue
             print(f"Restoring {app_name} with title {title} using {exe}")
             if exe.startswith("ms-settings:"):
@@ -137,7 +142,8 @@ def restore_state(conn):
             chrome_exe = APP_EXECUTABLES.get("Google Chrome")
             if not chrome_exe or not os.path.exists(chrome_exe):
                 chrome_exe = "chrome"
-            for _, url in tabs:
+            for tab in tabs:
+                url = tab[0]  # Fixed: Correct tuple unpacking
                 print(f"Opening tab: {url}")
                 subprocess.Popen([chrome_exe, url])
             time.sleep(2)
