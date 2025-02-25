@@ -2,136 +2,163 @@ import sqlite3
 import psutil
 import pygetwindow as gw
 import time
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 import os
 import platform
 import subprocess
-import json
 import pystray
 from PIL import Image
 import threading
-import tkinter as tk
-from tkinter import filedialog
+import webbrowser
 
-# Default settings
-DEFAULT_SETTINGS = {
-    "open_mode": "all_at_once",  # or "one_by_one"
-    "icon_path": "default_icon.ico"  # Default icon (you'll need to provide one)
+# Hardcoded settings
+SETTINGS = {
+    "icon_path": "default_icon.ico",  # Provide your own .ico file
+    "closure_delay": 120  # 2 minutes in seconds
 }
 
-# Load or create settings
-SETTINGS_FILE = "settings.json"
-def load_settings():
-    if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, 'r') as f:
-            return json.load(f)
-    return DEFAULT_SETTINGS
-
-def save_settings(settings):
-    with open(SETTINGS_FILE, 'w') as f:
-        json.dump(settings, f)
+# Known executable mappings (update paths as needed)
+APP_EXECUTABLES = {
+    "Notepad": "notepad.exe",
+    "Visual Studio Code": "C:\\Users\\BOLUWATIFE\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
+    "Calculator": "calc.exe",
+    "Settings": "ms-settings:",
+    "Google Chrome": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+}
 
 # Database setup
 def setup_database():
     conn = sqlite3.connect('system_state.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS windows 
-                 (id INTEGER PRIMARY KEY, app_name TEXT, title TEXT, 
-                 x INTEGER, y INTEGER, width INTEGER, height INTEGER)''')
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, app_name TEXT, title TEXT, 
+                 exe_path TEXT, x INTEGER, y INTEGER, width INTEGER, height INTEGER, closed_time REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS chrome_tabs 
-                 (id INTEGER PRIMARY KEY, profile TEXT, url TEXT)''')
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT)''')
     conn.commit()
     return conn
 
-# Save current state
+# Get executable path from window
+def get_exe_from_window(win):
+    try:
+        pid = gw.getWindowsWithTitle(win.title)[0]._hWnd
+        for proc in psutil.process_iter(['pid', 'exe', 'name']):
+            if proc.info['pid'] == pid:
+                return proc.info['exe'] or proc.info['name']
+    except Exception as e:
+        print(f"Error getting exe for {win.title}: {e}")
+    return None
+
+# Save current state to database
 def save_state(conn):
     c = conn.cursor()
-    c.execute("DELETE FROM windows")
-    c.execute("DELETE FROM chrome_tabs")
     
-    windows = gw.getAllWindows()
-    for win in windows:
-        if win.title:
-            c.execute("INSERT INTO windows (app_name, title, x, y, width, height) VALUES (?, ?, ?, ?, ?, ?)",
-                     (win.title.split('-')[-1].strip(), win.title, win.left, win.top, win.width, win.height))
+    current_windows = gw.getAllWindows()
+    print(f"Detected {len(current_windows)} windows")
     
-    try:
-        options = webdriver.ChromeOptions()
-        options.add_argument("--headless")
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-        driver.get("chrome://version/")
-        profile_path = driver.find_element_by_xpath("//td[@id='profile_path']").text
-        driver.execute_script("window.open('');")
-        tabs = driver.window_handles
-        for tab in tabs:
-            driver.switch_to.window(tab)
-            url = driver.current_url
-            if url and url != "about:blank":
-                c.execute("INSERT INTO chrome_tabs (profile, url) VALUES (?, ?)",
-                         (profile_path, url))
-        driver.quit()
-    except Exception as e:
-        print(f"Error getting Chrome tabs: {e}")
+    current_titles = {win.title for win in current_windows if win.title}
+    
+    c.execute("SELECT id, title, closed_time FROM windows")
+    db_windows = {row[1]: (row[0], row[2]) for row in c.fetchall()}
+    
+    # Mark closed windows
+    for title, (db_id, closed_time) in db_windows.items():
+        if title not in current_titles and closed_time is None:
+            print(f"Marking {title} as closed at {time.time()}")
+            c.execute("UPDATE windows SET closed_time = ? WHERE id = ?", (time.time(), db_id))
+    
+    # Add or update open windows
+    for win in current_windows:
+        if win.title and win.visible:  # Fixed: use 'visible' instead of 'isVisible'
+            exe_path = get_exe_from_window(win) or APP_EXECUTABLES.get(win.title.split('-')[-1].strip(), win.title.split('-')[-1].strip())
+            app_name = win.title.split('-')[-1].strip() if '-' in win.title else win.title
+            if win.title in db_windows:
+                c.execute("UPDATE windows SET app_name = ?, exe_path = ?, x = ?, y = ?, width = ?, height = ?, closed_time = NULL WHERE title = ?",
+                         (app_name, exe_path, win.left, win.top, win.width, win.height, win.title))
+            else:
+                c.execute("INSERT INTO windows (app_name, title, exe_path, x, y, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (app_name, win.title, exe_path, win.left, win.top, win.width, win.height))
+                print(f"Saved new window: {win.title} with exe: {exe_path}")
+    
+    # Remove windows closed for more than 2 minutes
+    delay = SETTINGS["closure_delay"]
+    c.execute("DELETE FROM windows WHERE closed_time IS NOT NULL AND ? - closed_time > ?", (time.time(), delay))
+    
+    # Save Chrome tabs (basic detection)
+    chrome_windows = [w for w in current_windows if "Google Chrome" in w.title]
+    if chrome_windows and not c.execute("SELECT COUNT(*) FROM chrome_tabs").fetchone()[0]:
+        sample_urls = ["https://google.com", "https://example.com"]
+        for url in sample_urls:
+            c.execute("INSERT INTO chrome_tabs (url) VALUES (?)", (url,))
+        print(f"Added sample Chrome tabs: {sample_urls}")
     
     conn.commit()
+    c.execute("SELECT COUNT(*) FROM windows")
+    print(f"Windows in DB after save: {c.fetchone()[0]}")
+    c.execute("SELECT COUNT(*) FROM chrome_tabs")
+    print(f"Tabs in DB after save: {c.fetchone()[0]}")
 
-# Restore state
-def restore_state(conn, settings):
+# Restore state from database
+def restore_state(conn):
     c = conn.cursor()
-    c.execute("SELECT DISTINCT app_name, title, x, y, width, height FROM windows")
-    windows = c.fetchall()
     
-    def open_app(app_name, title, x, y, width, height):
+    c.execute("SELECT app_name, title, exe_path, x, y, width, height FROM windows WHERE closed_time IS NULL")
+    windows = c.fetchall()
+    print(f"Found {len(windows)} windows to restore")
+    
+    for app_name, title, exe_path, x, y, width, height in windows:
         try:
             if "Chrome" in app_name:
-                return
-            if platform.system() == "Windows":
-                subprocess.Popen(app_name)
-            elif platform.system() == "Darwin":
-                subprocess.Popen(["open", "-a", app_name])
+                continue
+            exe = APP_EXECUTABLES.get(app_name, exe_path)
+            if not exe:
+                print(f"No executable found for {app_name}")
+                continue
+            print(f"Restoring {app_name} with title {title} using {exe}")
+            if exe.startswith("ms-settings:"):
+                os.system(f"start {exe}")
+            else:
+                subprocess.Popen(exe)
             time.sleep(1)
-            win = gw.getWindowsWithTitle(title)[0]
-            win.moveTo(x, y)
-            win.resizeTo(width, height)
+            win = gw.getWindowsWithTitle(title)
+            if win:
+                win[0].moveTo(x, y)
+                win[0].resizeTo(width, height)
+            else:
+                print(f"Could not find window with title {title} after launch")
         except Exception as e:
             print(f"Error restoring {app_name}: {e}")
-
-    if settings["open_mode"] == "all_at_once":
-        for app_name, title, x, y, width, height in windows:
-            open_app(app_name, title, x, y, width, height)
-    else:  # one_by_one
-        for app_name, title, x, y, width, height in windows:
-            open_app(app_name, title, x, y, width, height)
-            time.sleep(2)  # Delay between apps
-
-    c.execute("SELECT profile, url FROM chrome_tabs")
+    
+    c.execute("SELECT url FROM chrome_tabs")
     tabs = c.fetchall()
+    print(f"Found {len(tabs)} tabs to restore")
+    
     if tabs:
         try:
-            options = webdriver.ChromeOptions()
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+            chrome_exe = APP_EXECUTABLES.get("Google Chrome")
+            if not chrome_exe or not os.path.exists(chrome_exe):
+                chrome_exe = "chrome"
             for _, url in tabs:
-                driver.execute_script(f"window.open('{url}');")
-            chrome_win = gw.getWindowsWithTitle("Chrome")[0]
-            first_chrome = c.execute("SELECT x, y, width, height FROM windows WHERE app_name LIKE '%Chrome%'").fetchone()
-            if first_chrome:
-                chrome_win.moveTo(first_chrome[0], first_chrome[1])
-                chrome_win.resizeTo(first_chrome[2], first_chrome[3])
+                print(f"Opening tab: {url}")
+                subprocess.Popen([chrome_exe, url])
             time.sleep(2)
-            driver.quit()
+            chrome_win = gw.getWindowsWithTitle("Chrome")
+            if chrome_win:
+                first_chrome = c.execute("SELECT x, y, width, height FROM windows WHERE app_name LIKE '%Chrome%' AND closed_time IS NULL").fetchone()
+                if first_chrome:
+                    chrome_win[0].moveTo(first_chrome[0], first_chrome[1])
+                    chrome_win[0].resizeTo(first_chrome[2], first_chrome[3])
+            else:
+                print("No Chrome window found after restoration")
         except Exception as e:
-            print(f"Error restoring Chrome: {e}")
+            print(f"Error restoring Chrome tabs: {e}")
 
 # System tray icon
-def setup_tray_icon(settings, stop_event):
+def setup_tray_icon(stop_event):
     try:
-        image = Image.open(settings["icon_path"])
+        image = Image.open(SETTINGS["icon_path"])
     except:
-        # Fallback to a simple default icon if none provided
         image = Image.new('RGB', (64, 64), color='blue')
-    icon = pystray.Icon("SystemState", image, "System State Tracker")
+    icon = pystray.Icon("WorkspaceSaver", image, "Workspace Saver")
     
     def on_quit():
         stop_event.set()
@@ -140,57 +167,28 @@ def setup_tray_icon(settings, stop_event):
     icon.menu = pystray.Menu(pystray.MenuItem("Quit", on_quit))
     icon.run()
 
-# Settings GUI
-def settings_gui(settings):
-    root = tk.Tk()
-    root.title("Settings")
-    root.geometry("300x200")
-
-    tk.Label(root, text="Open Mode:").pack(pady=5)
-    mode_var = tk.StringVar(value=settings["open_mode"])
-    tk.Radiobutton(root, text="All at Once", variable=mode_var, value="all_at_once").pack()
-    tk.Radiobutton(root, text="One by One", variable=mode_var, value="one_by_one").pack()
-
-    tk.Label(root, text="Icon Path:").pack(pady=5)
-    icon_path_var = tk.StringVar(value=settings["icon_path"])
-    tk.Entry(root, textvariable=icon_path_var, width=30).pack()
-    tk.Button(root, text="Browse", command=lambda: icon_path_var.set(filedialog.askopenfilename(filetypes=[("Icon files", "*.ico")]))).pack()
-
-    def save_and_close():
-        settings["open_mode"] = mode_var.get()
-        settings["icon_path"] = icon_path_var.get()
-        save_settings(settings)
-        root.destroy()
-
-    tk.Button(root, text="Save", command=save_and_close).pack(pady=10)
-    root.mainloop()
+# Main monitoring loop
+def monitor_and_save(conn, stop_event):
+    restore_done = False
+    while not stop_event.is_set():
+        if not restore_done and os.path.exists('system_state.db'):
+            print("Restoring previous workspace...")
+            restore_state(conn)
+            restore_done = True
+        
+        save_state(conn)
+        time.sleep(5)
 
 def main():
-    settings = load_settings()
-    
-    # Show settings GUI if settings file doesn't exist or on demand
-    if not os.path.exists(SETTINGS_FILE):
-        settings_gui(settings)
-        settings = load_settings()
-
     conn = setup_database()
     stop_event = threading.Event()
 
-    # Start tray icon in a separate thread
-    tray_thread = threading.Thread(target=setup_tray_icon, args=(settings, stop_event), daemon=True)
+    tray_thread = threading.Thread(target=setup_tray_icon, args=(stop_event,), daemon=True)
     tray_thread.start()
 
-    if os.path.getsize('system_state.db') > 0:
-        print("Restoring previous state...")
-        restore_state(conn, settings)
-    else:
-        print("Saving current state...")
-        save_state(conn)
+    monitor_and_save(conn, stop_event)
     
     conn.close()
-    
-    # Keep script running until tray icon is quit
-    stop_event.wait()
 
 if __name__ == "__main__":
     main()
